@@ -6,6 +6,10 @@ from sympy.logic import boolalg
 from sympy.core import symbol
 from datetime import datetime
 from fileinput import filename
+from pickle import NONE
+from _overlapped import NULL
+from asyncio import __main__
+from sympy.physics.units.definitions.dimension_definitions import current
 
 sqlDB = sqlite3.connect('./datengrab.db')
 sqlCursor = sqlDB.cursor()
@@ -33,8 +37,10 @@ sqlTablesInit = {
                     ChildTagIdRef INTEGER NOT NULL,
                     FOREIGN KEY(ParentTagIdRef) REFERENCES tags(TagId),
                     FOREIGN KEY(ChildTagIdRef) REFERENCES tags(TagId),
-                    UNIQUE(ParentTagIdRef, ChildTagIdRef))"""
+                    UNIQUE(ChildTagIdRef))"""
 }
+
+rootTagName = "datengrab_root"
 
 
 def checkIfTableExists(tablename):
@@ -52,26 +58,111 @@ def firstTimeInit():
         if(not checkIfTableExists(tableName)):
             print(f"Table {tableName} does not exist yet, adding to database...")
             sqlCursor.execute(f"CREATE TABLE {tableName} {tableFields};")
+            if(tableName == 'hierarchy'):
+                _initRootTag(rootTagName)
+            
 
+def _getRefIdFromFileName(fileName):
+    sqlCursor.execute(f"""SELECT FileId
+                          FROM files
+                          WHERE FileName = "{fileName}"   
+                          """)
+    result = sqlCursor.fetchone()
+    if(result):
+        return result[0]
+    else:
+        return None
+
+def _getRefIdFromTagName(tagName):
+    sqlCursor.execute(f"""SELECT TagId
+                          FROM tags
+                          WHERE TagName = "{tagName}"   
+                          """)
+    result = sqlCursor.fetchone()
+    if(result):
+        return result[0]
+    else:
+        return None
 
 def newFile(fileName):
-    sqlCursor.execute(f"SELECT FileId FROM files WHERE FileName='{fileName}';")
-    fileId = sqlCursor.fetchone()
+    fileId = _getRefIdFromFileName(fileName)
     if(fileId):
-        print("file does already exist")
+        print("Error: file does already exist")
+        return
     else:
         sqlCursor.execute(f"INSERT INTO files (FileName) VALUES (?);", (fileName,))
 
+def _initRootTag(rootTagName):
+    sqlCursor.execute(f"INSERT INTO tags (TagName, TagCreationDate) VALUES (?,?);", (rootTagName, datetime.now()))
 
-def newTag(tagName):
-    tagId = sqlCursor.execute(f"SELECT TagId FROM tags WHERE TagName='{tagName}';")
-    fileId = sqlCursor.fetchone()
-    if(fileId):
-        print("tag does already exist")
-    else:
-        taggingTime = datetime.now()
-        sqlCursor.execute(f"INSERT INTO tags (TagName, TagCreationDate) VALUES (?,?);", (tagName, taggingTime))
+def newTag(newTagName, parentTagName):
+    #check that new parent exists before we break the old connection
+    parentTagId = _getRefIdFromTagName(parentTagName)
+    if(not parentTagId):
+        print("Error parent tag does not exist, will insert tag")
+        return
     
+    if(_getRefIdFromTagName(newTagName)):
+        print("Error: child tag does already exist")
+        return
+    taggingTime = datetime.now()
+    sqlCursor.execute(f"INSERT INTO tags (TagName, TagCreationDate) VALUES (?,?);", (newTagName, taggingTime))
+    childTagId = _getRefIdFromTagName(newTagName)
+    
+    sqlCursor.execute(f"INSERT INTO hierarchy (ParentTagIdRef, ChildTagIdRef) VALUES (?,?);", (parentTagId, childTagId))
+
+
+def moveExistingTagToNewParent(tagName, newParentTagName):
+    #check that new parent exists before we break the old connection
+    newParentTagId = _getRefIdFromTagName(newParentTagName)
+    if(not newParentTagId):
+        print("Error parent tag does not exist, will not break link")
+        return
+    
+    childTagId = _getRefIdFromTagName(tagName)
+    if(not childTagId):
+        print("Error child tag does not exist, will not break link")
+        return
+    
+    #delete old hierarchy reference
+    sqlCursor.execute(f"DELETE FROM hierarchy WHERE hierarchy.ChildTagIdRef = {childTagId};")
+    sqlCursor.execute(f"INSERT INTO hierarchy (ParentTagIdRef, ChildTagIdRef) VALUES (?,?);", (newParentTagId, childTagId))
+    
+
+def getParentTag(tagName):
+    tagId = _getRefIdFromTagName(tagName)
+    if(not tagId):
+        print("Tag Name is not known")
+        return
+    sqlCursor.execute( f""""
+                        SELECT tags.TagName
+                        FROM tags
+                        INNER JOIN
+                        (
+                            SELECT hierarchy.ParentTagIdRef 
+                            FROM hierarchy 
+                            WHERE hierarchy.ChildTagIdRef = {tagId}
+                        ) AS ChildTagRefs
+                        ON tags.TagId = ChildTagRefs.ParentTagIdRef
+                        """)
+    return [tagname[0] for tagname in sqlCursor.fetchall()]
+    
+
+def getChildTags(tagName):
+    tagId = _getRefIdFromTagName(tagName)
+    if(not tagId):
+        print("Tag Name is not known")
+        return None
+    sqlCursor.execute(  f"""SELECT tags.TagName
+                            FROM tags
+                            INNER JOIN
+                            (
+                                SELECT hierarchy.ChildTagIdRef 
+                                FROM hierarchy 
+                                WHERE hierarchy.ParentTagIdRef = {tagId}
+                            ) AS ChildTagRefs
+                            ON tags.TagId = ChildTagRefs.ChildTagIdRef;""")
+    return [tagname[0] for tagname in sqlCursor.fetchall()]
     
 def addTagToFile(fileName, tagName):
     sqlCursor.execute(f"SELECT FileId FROM files WHERE FileName='{fileName}';")
@@ -122,12 +213,7 @@ def findTagsOfFile(filename):
     return [tagName[0] for tagName in sqlCursor.fetchall()]
 
 
-def _getRefIdFromTagName(tagName):
-    sqlCursor.execute(f"""SELECT TagId
-                          FROM tags
-                          WHERE TagName = "{tagName}"   
-                          """)
-    return sqlCursor.fetchone()[0]
+
 
 
 def _sqlSubQueryFileIdWithoutTag(TagRefId, SubQueryName):
@@ -264,41 +350,75 @@ def findFilesWithTags(LogicalTagStatement):
     return [filename[0] for filename in sqlCursor.fetchall()]
 
 
+class tagInHierarchy:
+    parent = None
+    childs = None
+    name = None
+    _childsNamelist = []
+    def __str__(self):
+        string = f"{self.name} ("
+        for child in self.childs:
+            string += " "+child.__str__()+" )"
+        return string
+        
+        
+    
+def getTagHierarchy():
+    root = tagInHierarchy()
+    root.name = rootTagName
+    root.childs = []
+    root.parent = None
+    root._childsNamelist = getChildTags(root.name)
+    currentTag = root
+    while True:
+        #are all children of the current tag parsed?
+        if(len(currentTag.childs) < len(currentTag._childsNamelist)):
+            newTag = tagInHierarchy()
+            newTag.parent = currentTag
+            newTag.childs = []
+            newTag.name = currentTag._childsNamelist[len(currentTag.childs)]
+            newTag._childsNamelist = getChildTags(newTag.name)
+            currentTag.childs.append(newTag)
+            currentTag = newTag
+            continue
+        if(root is currentTag):
+            break
+        currentTag = currentTag.parent
+    print(root)
+    return root
+    
+    
+    
+    
 
-"""
-parser = argparse.ArgumentParser(description="tag based file manager")
-parser.add_argument('-a', help="adds the following tags to...")
-parser.add_argument('-c', help="...the specified filepaths which will be copied inside the tagging directory")
-parser.add_argument('-d', help="removes the following tags from...")
-parser.add_argument('-f', help="...the specified file names inside the tagging directory")
-parser.add_argument('-s', help="search for the logically evaluated expressions of tags (supporting !,&,| and ->* for all children) (either by tagname or full hierarchical name ->software->pythonprogs or with wildcard ->computer->*)")
-parser.add_argument('-i', help="database integrity check")
-parser.add_argument('-u', help="disk usage stats and number of tracked files")
-args = parser.parse_args()
-
-"""
-
+if __name__  == "__main__":
+    print("Please use ./gui.py instead...")
 
 
 firstTimeInit()
 newFile("testFile.txt")
 newFile("testFile2.txt")
 newFile("testFile3.txt")
-newTag("tagA")
-newTag("tagB")
-newTag("tagC")
-newTag("tagD")
+newTag("tagA","datengrab_root")
+newTag("tagB","datengrab_root")
+newTag("tagC","datengrab_root")
+newTag("tagC_childA","tagC")
 addTagToFile("testFile.txt","tagA")
 addTagToFile("testFile.txt","tagB")
 addTagToFile("testFile2.txt","tagA")
 addTagToFile("testFile2.txt","tagC")
-addTagToFile("testFile2.txt","tagD")
+addTagToFile("testFile2.txt","tagC_childA")
 addTagToFile("testFile3.txt","tagB")
 addTagToFile("testFile3.txt","tagC")
 findTagsOfFile("testFile.txt")
 findTagsOfFile("testFile2.txt")
+
+sqlCursor.execute("SELECT * FROM tags")
+print(sqlCursor.fetchall())
+
 #findFileWithTags("tagC")
 #findFileWithTags("tagA  tagB")
-print(findFilesWithTags("tagA | tagD"))
+print(findFilesWithTags("tagA | tagC_childA"))
+getTagHierarchy()
 
 sqlDB.commit()
