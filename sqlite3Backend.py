@@ -1,15 +1,12 @@
 import sqlite3
+import shutil
 import re
-import argparse
+from pathlib import Path, PurePath
 from sympy.parsing.sympy_parser import parse_expr
 from sympy.logic import boolalg
 from sympy.core import symbol
 from datetime import datetime
-from fileinput import filename
-from pickle import NONE
-from _overlapped import NULL
-from asyncio import __main__
-from sympy.physics.units.definitions.dimension_definitions import current
+
 
 sqlDB = sqlite3.connect('./datengrab.db')
 sqlCursor = sqlDB.cursor()
@@ -40,6 +37,8 @@ sqlTablesInit = {
                     UNIQUE(ChildTagIdRef))"""
 }
 
+
+filestorage_location = Path.cwd() / "taggedFiles"
 rootTagName = "datengrab_root"
 
 
@@ -84,13 +83,29 @@ def _getRefIdFromTagName(tagName):
     else:
         return None
 
-def newFile(fileName):
+def importFile(fileSourcePath):
+    if(not isinstance(fileSourcePath, PurePath)):
+        raise ValueError
+    
+    fileName = fileSourcePath.name
+    fileDestinationPath = filestorage_location / fileName
+    if(not fileSourcePath.is_file()):
+        raise ValueError
+    
+    #check if file is already inside the directory
+    if(fileDestinationPath.exists()):
+        raise ValueError
+    
+    shutil.copy2(fileSourcePath, fileDestinationPath)
+    _newFile(fileName)
+
+def _newFile(fileName):
     fileId = _getRefIdFromFileName(fileName)
     if(fileId):
         print("Error: file does already exist")
-        return
-    else:
-        sqlCursor.execute(f"INSERT INTO files (FileName) VALUES (?);", (fileName,))
+        return None
+        #raise ValueError
+    sqlCursor.execute(f"INSERT INTO files (FileName) VALUES (?);", (fileName,))
 
 def _initRootTag(rootTagName):
     sqlCursor.execute(f"INSERT INTO tags (TagName, TagCreationDate) VALUES (?,?);", (rootTagName, datetime.now()))
@@ -320,7 +335,13 @@ def findFilesWithTags(LogicalTagStatement):
     ExpressionString = ''.join(TagSplitted)
     print(f"expr: {ExpressionString}")
     
-    dnfExpr = boolalg.to_dnf(parse_expr(ExpressionString))
+    try:
+        parsedExpression = parse_expr(ExpressionString)
+        dnfExpr = boolalg.to_dnf(parsedExpression)
+    except Exception:
+        raise ValueError
+    
+    
     
     #if(type(dnfExpr) is boolalg.Not): TODO case for only one tag non negated
     sqlQuery = """SELECT files.FileName
@@ -341,9 +362,8 @@ def findFilesWithTags(LogicalTagStatement):
         sqlQuery += _sqlSubQueryFromDnfAnd(dnfExpr, "combinedFileRefSubQuery")
     elif(type(dnfExpr) == boolalg.Or):       
         sqlQuery += _sqlSubQueryFromDnfOr(dnfExpr, "combinedFileRefSubQuery") 
-        pass
     else:
-        raise Exception("bad search string")
+        raise ValueError
     sqlQuery += """ON files.FileId = combinedFileRefSubQuery.FileIdRef"""
     print(sqlQuery)
     sqlCursor.execute(sqlQuery)
@@ -351,32 +371,27 @@ def findFilesWithTags(LogicalTagStatement):
 
 
 class tagInHierarchy:
-    parent = None
-    childs = None
-    name = None
-    _childsNamelist = []
+    def __init__(self, name, parent, childs):
+        self.name  = name
+        self.parent = parent
+        self.childs = childs
+        self._childsNamelist = []
+        
     def __str__(self):
         string = f"{self.name} ("
         for child in self.childs:
-            string += " "+child.__str__()+" )"
+            string += " " + str(child) + " )"
         return string
-        
-        
-    
+
+
 def getTagHierarchy():
-    root = tagInHierarchy()
-    root.name = rootTagName
-    root.childs = []
-    root.parent = None
+    root = tagInHierarchy(rootTagName, None, [])
     root._childsNamelist = getChildTags(root.name)
     currentTag = root
     while True:
         #are all children of the current tag parsed?
         if(len(currentTag.childs) < len(currentTag._childsNamelist)):
-            newTag = tagInHierarchy()
-            newTag.parent = currentTag
-            newTag.childs = []
-            newTag.name = currentTag._childsNamelist[len(currentTag.childs)]
+            newTag = tagInHierarchy(currentTag._childsNamelist[len(currentTag.childs)], currentTag, [])
             newTag._childsNamelist = getChildTags(newTag.name)
             currentTag.childs.append(newTag)
             currentTag = newTag
@@ -396,9 +411,18 @@ if __name__  == "__main__":
 
 
 firstTimeInit()
-newFile("testFile.txt")
-newFile("testFile2.txt")
-newFile("testFile3.txt")
+try:
+    _newFile("testFile.txt")
+except Exception:
+    pass
+try:
+    _newFile("testFile2.txt")
+except Exception:
+    pass
+try:
+    _newFile("testFile3.txt")
+except Exception:
+    pass
 newTag("tagA","datengrab_root")
 newTag("tagB","datengrab_root")
 newTag("tagC","datengrab_root")
@@ -418,7 +442,7 @@ print(sqlCursor.fetchall())
 
 #findFileWithTags("tagC")
 #findFileWithTags("tagA  tagB")
-print(findFilesWithTags("tagA | tagC_childA"))
+#print(findFilesWithTags("tagA | tagC_childA"))
 getTagHierarchy()
 
 sqlDB.commit()

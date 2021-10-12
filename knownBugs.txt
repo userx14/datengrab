@@ -1,0 +1,2 @@
+the search query (! tagname) breaks because the space character is replaced with an and character
+-> only insert & when the adjacent items are tags
