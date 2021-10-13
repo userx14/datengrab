@@ -6,6 +6,7 @@ from sympy.parsing.sympy_parser import parse_expr
 from sympy.logic import boolalg
 from sympy.core import symbol
 from datetime import datetime
+from fileinput import filename
 
 
 sqlDB = sqlite3.connect('./datengrab.db')
@@ -202,6 +203,43 @@ def addTagToFile(fileName, tagName):
     else:
         print("ref already exists")
     
+def deleteFileAndItsTags(fileName):
+    fileStoragePath = filestorage_location / fileName
+    refId = _getRefIdFromFileName(fileName)
+    #check if present in database and on disk
+    if(refId == None):
+        raise ValueError
+    if(not fileStoragePath.exists()):
+        raise ValueError
+    
+    fileStoragePath.unlink()
+    sqlCursor.execute(f"DELETE FROM refs WHERE refs.FileIdRef = {refId};")
+    sqlDB.commit()
+    return
+
+def renameFile(oldFileName, newFileName):
+    fileStoragePathOld = filestorage_location / oldFileName
+    if(not fileStoragePathOld.is_file()):
+        raise ValueError
+    
+    fileStoragePathNew = filestorage_location / newFileName
+    #check if new filename already exists
+    if(fileStoragePathNew.exists()):
+        raise ValueError
+    
+    if(_getRefIdFromFileName(oldFileName) == None):
+        raise ValueError
+    
+    if(_getRefIdFromFileName(newFileName)):
+        raise ValueError
+    
+    shutil.move(fileStoragePathOld, fileStoragePathNew)
+    sqlCursor.execute(f"""UPDATE files
+                          SET FileName = "{newFileName}" 
+                          WHERE FileName = "{oldFileName}" """)
+    sqlDB.commit()
+    return
+
         
 def renameTag(oldTagName, newTagName):
     sqlCursor.execute(f"""UPDATE tags
@@ -314,7 +352,6 @@ def _sqlSubQueryFromDnfOr(dnfExpr, SubQueryName):
             sqlQuery += _sqlSubQueryFileIdWithTag(tagRefId, f"orSubQuery{argIdx}")
     sqlQuery += f" ) AS {SubQueryName} "
     return sqlQuery    
-    
     
 def findFilesWithTags(LogicalTagStatement):
     #TODO check for bad input which is a valid sympy expression
