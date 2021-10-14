@@ -1,6 +1,7 @@
 import sqlite3Backend as datengrabSql
 import os, time, sys, datetime
 from pathlib import Path
+from os import path
 from PyQt5.QtGui import *
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
@@ -162,6 +163,11 @@ class DatengrabFileTable(QTableWidget):
             for filePath in filePaths:
                 print(f"addfile {filePath}")
                 sqlite3Backend.importFile(filePath)
+            fileNames = [filePath.name for filePath in filePaths]
+            self.mainClassReference.filesList = fileNames
+            self.mainClassReference.filesTagsDict.clear()
+            for fileName in fileNames:
+                self.mainClassReference.filesTagsDict[fileName] = []
         else:
             event.ignore()
             print("ignored drop event")
@@ -194,7 +200,7 @@ class DatengrabFileTable(QTableWidget):
         drag.exec_(Qt.CopyAction)
         print("Start drag")
 
-
+nameForNewTag = "newTagName"
 
 class DatengrabAllTagsTree(QTreeWidget):
     def __init__(self, mainClassReference):
@@ -218,51 +224,71 @@ class DatengrabAllTagsTree(QTreeWidget):
         if(self.state() == QAbstractItemView.EditingState):
             newTagName = item.text(0)
             oldTagName = self.lastEditedTagname
-            print(f"renaming {oldTagName} to {newTagName}")
-            sqlite3Backend.renameTag(oldTagName, newTagName)
-            for tagsForFile in self.mainClassReference.filesTagsDict.values():
-                print(tagsForFile)
-                for tagIdx, tagName in enumerate(tagsForFile):
-                    if tagName == oldTagName:
-                        tagsForFile[tagIdx] = newTagName
-            print(self.mainClassReference.filesTagsDict)
-            self.mainClassReference.fileTable.on_selectionChanged(None, None)
+            if(oldTagName == nameForNewTag):
+                print(f"creating {newTagName} under {self.parentTagNameForNewTag}")
+                sqlite3Backend.newTag(newTagName, self.parentTagNameForNewTag)
+            else:
+                print(f"renaming {oldTagName} to {newTagName}")
+                sqlite3Backend.renameTag(oldTagName, newTagName)
+                for tagsForFile in self.mainClassReference.filesTagsDict.values():
+                    print(tagsForFile)
+                    for tagIdx, tagName in enumerate(tagsForFile):
+                        if tagName == oldTagName:
+                            tagsForFile[tagIdx] = newTagName
+                print(self.mainClassReference.filesTagsDict)
+                self.mainClassReference.fileTable.on_selectionChanged(None, None)
         else:
             self.lastEditedTagname = item.text(0)
 
    
     
     def contextMenuEvent(self, event):
+        if not self.currentItem():
+            return
         currentTagItem = self.currentItem()
         currentTagName = currentTagItem.text(0)
         self.lastEditedTagname = currentTagItem.text(0)
+        print(f"context menu with {self.lastEditedTagname}")
         tagContextMenu = QMenu(self)
         addAction = tagContextMenu.addAction("add child tag")
         renameAction = tagContextMenu.addAction("rename")
-        deleteAction = tagContextMenu.addAction("delete")
+        if currentTagName != sqlite3Backend.rootTagName:
+            deleteAction = tagContextMenu.addAction("delete")
         action = tagContextMenu.exec_(self.mapToGlobal(event.pos()))
         if action == addAction:
-            print("TODO")
-            #sqlite3Backend.newTag(newTagName, parentTagName)
+            self.parentTagNameForNewTag = currentTagItem.text(0)
+            childInTreeWidget = QTreeWidgetItem()
+            childInTreeWidget.setText(0, "newTagName")
+            currentTagItem.addChild(childInTreeWidget)
+            childInTreeWidget.setFlags(childInTreeWidget.flags() | Qt.ItemIsEditable)
+            currentTagItem.setExpanded(True)
+            self.lastItemInEditMode = childInTreeWidget
+            self.editItem(childInTreeWidget, 0)
+            #the actual creation is done when the edit is confirmed / aborted in tagEditComplete
         elif action == renameAction:
             self.lastItemInEditMode = currentTagItem
             currentTagItem.setFlags(currentTagItem.flags() | Qt.ItemIsEditable)
             self.editItem(currentTagItem)
-            print("rename")
-        elif action == deleteAction:
+        elif currentTagName != sqlite3Backend.rootTagName and action == deleteAction:
+            
             deletionConfirmed = DatengrabTagDeleteDialog(currentTagName).exec_()
             if deletionConfirmed:
-                print("todo implement recursive delete in backend")
-                print("todo remove item and childs from tree view")
-            print("delete")
-        else:
-            print(f"Error unknown action {action}")
+                allDeletedTagNamesList = sqlite3Backend.deleteTagsAndChildTags(currentTagName)
+                print(allDeletedTagNamesList)
+                for deletedTagName in allDeletedTagNamesList:
+                    for tagNames in self.mainClassReference.filesTagsDict.values():
+                        if(deletedTagName in tagNames):
+                            tagNames.remove(deletedTagName)
+                self.mainClassReference.fileTable.on_selectionChanged(None, None)          
+                currentTagItem.parent().removeChild(currentTagItem)
+                self.removeItemWidget(currentTagItem, 0)
 
     def getDataFromBackend(self):
         self.clear()
         tagHierarchy = datengrabSql.getTagHierarchy()
         topLevelItem = self.recursiveTreeWidgetFill(tagHierarchy)
         self.addTopLevelItem(topLevelItem)
+        topLevelItem.setExpanded(True)
 
     def recursiveTreeWidgetFill(self, currentTagInHierarchy):
         newChild = QTreeWidgetItem()
@@ -273,31 +299,39 @@ class DatengrabAllTagsTree(QTreeWidget):
 
     def dropEvent(self, event):
         droppedOnQIndex = self.indexAt(event.pos())
-        droppedOnTagName = droppedOnQIndex.data()
-        print(droppedOnTagName)
+        if(not droppedOnQIndex):
+            event.ignore()
+            return
+        droppedOnTag = self.itemFromIndex(droppedOnQIndex)
+        if(droppedOnTag is None):
+            event.ignore()
+            return 
+        droppedOnTagName = droppedOnTag.text(0)
+        print(f"dropped on {droppedOnTagName}")
         mimeData = event.mimeData()
-        #check that mime data is a tag,   that the dropped tag is not the root tag,    and that the drop target is a valid tag in the tree view
-        if(mimeData.hasFormat("app/tagName") and mimeData.hasFormat("app/parentTagName") and droppedOnTagName):
-            tagName = str(mimeData.data("app/tagName"), 'utf-8')
-            parentTagName = str(mimeData.data("app/parentTagName"), 'utf-8')
-            #check that tag can not be dropped on itself
-            if(droppedOnTagName != parentTagName):
-                #make sure one can't tag one tree onto one of it's deeper nested childs or itself
-                droppedOnIsNotChild = True;
-                currentCheckedTagInHierarchy = droppedOnQIndex
-                while(currentCheckedTagInHierarchy.data() != None):
-                    if(currentCheckedTagInHierarchy.data() == tagName):
-                        droppedOnIsNotChild = False
-                        break;
-                    currentCheckedTagInHierarchy = currentCheckedTagInHierarchy.parent()
-                    print(currentCheckedTagInHierarchy.data())
-                if(droppedOnIsNotChild):
-                    event.accept()
-                    sqlite3Backend.moveExistingTagToNewParent(tagName, droppedOnTagName)
-                    self.getDataFromBackend()
+        #check that mime data is a tag and that the drop target is a valid tag is on an valid element inside the tree view
+        if(mimeData.hasFormat("app/tagName") and droppedOnTagName):
+            draggedTag = self.storedDragItem
+            draggedTagsParent = self.storedDragItem.parent()
+            draggedTagName = draggedTag.text(0)
+            if (draggedTagsParent == None) or (draggedTagsParent == droppedOnTag):
+                event.ignore()
+                return
+            #make sure one can't tag one tree onto one of it's deeper nested childs or itself
+            currentCheckedTagInHierarchy = droppedOnQIndex
+            while(currentCheckedTagInHierarchy.data() != None):
+                if(currentCheckedTagInHierarchy.data() == draggedTagName):
+                    event.ignore()
                     return
+                currentCheckedTagInHierarchy = currentCheckedTagInHierarchy.parent()
+            sqlite3Backend.moveExistingTagToNewParent(draggedTagName, droppedOnTagName)
+            indexOfChild = draggedTagsParent.indexOfChild(draggedTag)
+            droppedOnTag.addChild(draggedTagsParent.takeChild(indexOfChild))
+            droppedOnTag.setExpanded(True)
+            event.accept()
+            return
         event.ignore()
-        return
+
 
     def dragEnterEvent(self, event):
         if(event.mimeData().hasFormat("app/tagName")):
@@ -307,38 +341,42 @@ class DatengrabAllTagsTree(QTreeWidget):
 
     def dragMoveEvent(self, event):
         droppedOnQIndex = self.indexAt(event.pos())
-        droppedOnTagName = droppedOnQIndex.data()
-        print(droppedOnTagName)
+        if(not droppedOnQIndex):
+            event.ignore()
+            return
+        droppedOnTag = self.itemFromIndex(droppedOnQIndex)
+        if(droppedOnTag is None):
+            print("Here")
+            event.ignore()
+            return 
+        droppedOnTagName = droppedOnTag.text(0)
+        #print(f"moved over {droppedOnTagName}")
         mimeData = event.mimeData()
-        #avoid dropping on same element or parent of current element
-        if(mimeData.hasFormat("app/tagName") and mimeData.hasFormat("app/parentTagName") and droppedOnTagName):
-            tagName = str(mimeData.data("app/tagName"), 'utf-8')
-            parentTagName = str(mimeData.data("app/parentTagName"), 'utf-8')
-            #check that tag can not be dropped on itself
-            if(droppedOnTagName != parentTagName):
-                #make sure one can't tag one tree onto one of it's deeper nested childs or itself
-                droppedOnIsNotChild = True;
-                currentCheckedTagInHierarchy = droppedOnQIndex
-                while(currentCheckedTagInHierarchy.data() != None):
-                    if(currentCheckedTagInHierarchy.data() == tagName):
-                        droppedOnIsNotChild = False
-                        break;
-                    currentCheckedTagInHierarchy = currentCheckedTagInHierarchy.parent()
-                    print(currentCheckedTagInHierarchy.data())
-                if(droppedOnIsNotChild):
-                    event.accept()
+        #check that mime data is a tag and that the drop target is a valid tag is on an valid element inside the tree view
+        if(mimeData.hasFormat("app/tagName") and droppedOnTagName):
+            draggedTag = self.storedDragItem
+            draggedTagsParent = self.storedDragItem.parent()
+            draggedTagName = draggedTag.text(0)
+            if (draggedTagsParent == None) or (draggedTagsParent == droppedOnTag):
+                event.ignore()
+                return
+            #make sure one can't tag one tree onto one of it's deeper nested childs or itself
+            currentCheckedTagInHierarchy = droppedOnQIndex
+            while(currentCheckedTagInHierarchy.data() != None):
+                if(currentCheckedTagInHierarchy.data() == draggedTagName):
+                    event.ignore()
                     return
+                currentCheckedTagInHierarchy = currentCheckedTagInHierarchy.parent()
+            event.accept()
+            return
         event.ignore()
-        return
         return
 
     def startDrag(self, *args, **kwargs):
         mimeData = QMimeData()
         mimePayloadTagName = QByteArray(bytes(self.currentItem().text(0), encoding='utf8'))
         mimeData.setData("app/tagName", mimePayloadTagName)
-        if(self.currentItem().parent() != None): #root tag has no parent
-            mimePayloadParentTagName = QByteArray(bytes(self.currentItem().parent().text(0), encoding='utf8'))
-            mimeData.setData("app/parentTagName", mimePayloadParentTagName)
+        self.storedDragItem = self.currentItem()
         drag = QDrag(self)
         drag.setMimeData(mimeData)
         drag.exec_(Qt.MoveAction)
@@ -369,7 +407,8 @@ class DatengrabSelectionTagsTable(QTableWidget):
             for fileName in selectedFilesList:
                 print(f"adding tag {tagName} to {fileName}")
                 sqlite3Backend.addTagToFile(fileName, tagName)
-                self.mainClassReference.filesTagsDict[fileName] = sqlite3Backend.findTagsOfFile(fileName) #update tags of file
+                if(self.mainClassReference.filesTagsDict):
+                    self.mainClassReference.filesTagsDict[fileName] = sqlite3Backend.getTagsOfFile(fileName) #update tags of file
             self.mainClassReference.fileTable.on_selectionChanged(None, None)
             return
         event.ignore()
@@ -396,7 +435,29 @@ class DatengrabSelectionTagsTable(QTableWidget):
             tagCountItem = QTableWidgetItem(str(value))
             tagCountItem.setFlags(tagCountItem.flags() & (~Qt.ItemIsEditable))
             self.setItem(index, 1, tagCountItem)
-
+    
+    def contextMenuEvent(self, event):
+        if not self.currentItem():
+            return
+        currentTagItem = self.item(self.currentItem().row(), 0) 
+        currentTagName = currentTagItem.text()
+        tagContextMenu = QMenu(self)
+        addToSelAction = tagContextMenu.addAction("add to all selected files")
+        remFromSelAction = tagContextMenu.addAction("remove from all selected files")
+        action = tagContextMenu.exec_(self.mapToGlobal(event.pos()))
+        if action == addToSelAction:
+            for fileName in self.mainClassReference.fileTable.getSelectedFilesList():
+                sqlite3Backend.addTagToFile(fileName, currentTagName)
+                if(currentTagName not in self.mainClassReference.filesTagsDict[fileName]):
+                    self.mainClassReference.filesTagsDict[fileName].append(currentTagName)
+            self.mainClassReference.fileTable.on_selectionChanged(None, None)
+        elif action == remFromSelAction:
+            for fileName in self.mainClassReference.fileTable.getSelectedFilesList():
+                sqlite3Backend.removeTagFromFile(fileName, currentTagName)
+                if(currentTagName in self.mainClassReference.filesTagsDict[fileName]):
+                    self.mainClassReference.filesTagsDict[fileName].remove(currentTagName)
+            self.mainClassReference.fileTable.on_selectionChanged(None, None)
+    
 
 class DatengrabTagSearchLineEdit(QLineEdit):
     def __init__(self):
@@ -467,7 +528,7 @@ class DatengrabMainWindow(QWidget):
         #file searchbox and label
         fileSearchVBox_label = QLabel("file properties filter:")
         fileSearchVBox_LineEdit = QLineEdit()
-        fileSearchVBox_LineEdit.setPlaceholderText("fileName in [\"doc.pdf\"] & fileDate < 2021")
+        fileSearchVBox_LineEdit.setPlaceholderText("datetime.fromtimestamp(fileStat.st_mtime) < datetime.now()")
         self.fileSearchLineEdit = fileSearchVBox_LineEdit
 
         fileSearchVBox = QVBoxLayout()
@@ -552,21 +613,36 @@ class DatengrabMainWindow(QWidget):
         fileSearchString = self.fileSearchLineEdit.text()
 
         try:
-            potentialFilesWithTagList = datengrabSql.findFilesWithTags(tagSearchString)
+            potentialFilesForTagSearchList = datengrabSql.getFilesWithTags(tagSearchString)
         except ValueError:
             lineEditErrorPalette = QPalette()
             lineEditErrorPalette.setColor(QPalette.Base, Qt.red)
             self.tagSearchLineEdit.setPalette(lineEditErrorPalette)
             self.progressBarAnimateStop()
             return
-
+        
+        def fileSearchFilter(fileName):
+            
+            importString = "exec('from datetime import datetime') or "
+            importString += "exec('from os import path') or "
+            localsDict = dict()
+            
+            localsDict["fileStat"] = os.stat(Path.cwd() / sqlite3Backend.filestorage_location / fileName)
+            print(localsDict["fileStat"]) 
+            return eval(importString + fileSearchString, None, localsDict)
         #todo handle file search (name, date, ...)
+        if(fileSearchString):
+            filteredFiles = list(filter(fileSearchFilter, potentialFilesForTagSearchList))
+        else:
+            filteredFiles = potentialFilesForTagSearchList
+        #filteredFiles = potentialFilesForTagSearchList
 
-
-        self.filesList = potentialFilesWithTagList
+        print(filteredFiles)
+        
+        self.filesList = filteredFiles
         self.filesTagsDict = dict()
         for filename in self.filesList:
-            self.filesTagsDict[filename] = sqlite3Backend.findTagsOfFile(filename)
+            self.filesTagsDict[filename] = sqlite3Backend.getTagsOfFile(filename)
 
 
         self.fileTable.updateDataFromMainClass()

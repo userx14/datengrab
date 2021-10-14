@@ -54,12 +54,16 @@ def checkIfTableExists(tablename):
 
 def firstTimeInit():
     #check if all tables exist
+    needReinit = False
     for (tableName,tableFields) in sqlTablesInit.items():
         if(not checkIfTableExists(tableName)):
             print(f"Table {tableName} does not exist yet, adding to database...")
+            needReinit = True
             sqlCursor.execute(f"CREATE TABLE {tableName} {tableFields};")
             if(tableName == 'hierarchy'):
                 _initRootTag(rootTagName)
+    sqlDB.commit()
+    return needReinit
             
 
 def _getRefIdFromFileName(fileName):
@@ -99,6 +103,7 @@ def importFile(fileSourcePath):
     
     shutil.copy2(fileSourcePath, fileDestinationPath)
     _newFile(fileName)
+    sqlDB.commit()
 
 def _newFile(fileName):
     fileId = _getRefIdFromFileName(fileName)
@@ -124,8 +129,8 @@ def newTag(newTagName, parentTagName):
     taggingTime = datetime.now()
     sqlCursor.execute(f"INSERT INTO tags (TagName, TagCreationDate) VALUES (?,?);", (newTagName, taggingTime))
     childTagId = _getRefIdFromTagName(newTagName)
-    
     sqlCursor.execute(f"INSERT INTO hierarchy (ParentTagIdRef, ChildTagIdRef) VALUES (?,?);", (parentTagId, childTagId))
+    sqlDB.commit()
 
 
 def moveExistingTagToNewParent(tagName, newParentTagName):
@@ -143,7 +148,7 @@ def moveExistingTagToNewParent(tagName, newParentTagName):
     #delete old hierarchy reference
     sqlCursor.execute(f"DELETE FROM hierarchy WHERE hierarchy.ChildTagIdRef = {childTagId};")
     sqlCursor.execute(f"INSERT INTO hierarchy (ParentTagIdRef, ChildTagIdRef) VALUES (?,?);", (newParentTagId, childTagId))
-    
+    sqlDB.commit()
 
 def getParentTag(tagName):
     tagId = _getRefIdFromTagName(tagName)
@@ -175,11 +180,17 @@ def getChildTags(tagName):
                             (
                                 SELECT hierarchy.ChildTagIdRef 
                                 FROM hierarchy 
-                                WHERE hierarchy.ParentTagIdRef = {tagId}
+                                WHERE hierarchy.ParentTagIdRef = '{tagId}'
                             ) AS ChildTagRefs
                             ON tags.TagId = ChildTagRefs.ChildTagIdRef;""")
     return [tagname[0] for tagname in sqlCursor.fetchall()]
-    
+
+def removeTagFromFile(fileName, tagName):
+    fileId = _getRefIdFromFileName(fileName)
+    tagId = _getRefIdFromTagName(tagName)
+    sqlCursor.execute(f"DELETE FROM refs WHERE refs.FileIdRef = '{fileId}' AND refs.TagIdRef = '{tagId}';")
+    sqlDB.commit()
+
 def addTagToFile(fileName, tagName):
     sqlCursor.execute(f"SELECT FileId FROM files WHERE FileName='{fileName}';")
     fileIdTulple = sqlCursor.fetchone()
@@ -202,6 +213,7 @@ def addTagToFile(fileName, tagName):
         sqlCursor.execute(f"INSERT INTO refs (TagIdRef, FileIdRef) VALUES (?,?);", (tagIdTulple[0], fileIdTulple[0]))
     else:
         print("ref already exists")
+    sqlDB.commit()
     
 def deleteFileAndItsTags(fileName):
     fileStoragePath = filestorage_location / fileName
@@ -213,9 +225,28 @@ def deleteFileAndItsTags(fileName):
         raise ValueError
     
     fileStoragePath.unlink()
-    sqlCursor.execute(f"DELETE FROM refs WHERE refs.FileIdRef = {refId};")
+    sqlCursor.execute(f"DELETE FROM refs WHERE refs.FileIdRef = '{refId}';")
     sqlDB.commit()
     return
+
+def deleteTagsAndChildTags(tagName):
+    print(f"delete {tagName}")
+    deletedSubTagsList = _deleteTagsAndChildTagsRecursive(tagName)
+    deletedSubTagsList.append(tagName)
+    sqlDB.commit()
+    return deletedSubTagsList
+
+#returns names of all deleted child tags
+def _deleteTagsAndChildTagsRecursive(tagName):
+    deleteTagRefId = _getRefIdFromTagName(tagName)
+    childTagsList = getChildTags(tagName)
+    deletedSubTagsList = childTagsList.copy()
+    sqlCursor.execute(f"DELETE FROM tags WHERE tags.TagName = '{tagName}';")
+    sqlCursor.execute(f"DELETE FROM refs WHERE refs.TagIdRef = '{deleteTagRefId}';")
+    sqlCursor.execute(f"DELETE FROM hierarchy WHERE hierarchy.ChildTagIdRef = '{deleteTagRefId}';")
+    for childTag in childTagsList:
+        deletedSubTagsList.extend(deleteTagsAndChildTags(childTag))
+    return deletedSubTagsList
 
 def renameFile(oldFileName, newFileName):
     fileStoragePathOld = filestorage_location / oldFileName
@@ -245,9 +276,10 @@ def renameTag(oldTagName, newTagName):
     sqlCursor.execute(f"""UPDATE tags
                           SET TagName = "{newTagName}"
                           WHERE TagName = "{oldTagName}";""")
+    sqlDB.commit()
+    return
 
-
-def findTagsOfFile(filename):
+def getTagsOfFile(filename):
     
     #relates the files to the tags by performing a double join with the refs table
     #then only the tag name is extracted
@@ -353,20 +385,20 @@ def _sqlSubQueryFromDnfOr(dnfExpr, SubQueryName):
     sqlQuery += f" ) AS {SubQueryName} "
     return sqlQuery    
     
-def findFilesWithTags(LogicalTagStatement):
+def getFilesWithTags(LogicalTagStatement):
     #TODO check for bad input which is a valid sympy expression
     
     #convert "not"-operator into readable format for sympy
     LogicalTagStatement = LogicalTagStatement.replace("!","~")
     
     #support implied AND   
-    TagSplitted = re.split(r'([\w]+)', LogicalTagStatement)
+    TagSplitted = re.split(r'([~|\s|&|\|]+)', LogicalTagStatement)
+    print(TagSplitted)
     for tagIdx in range(len(TagSplitted)):
         #check if the current token is a tag
-        if TagSplitted[tagIdx].isspace():
-            TagSplitted[tagIdx] = " & "
-        if TagSplitted[tagIdx].strip() == "~":
-            TagSplitted[tagIdx] = " &~ "
+        if re.match(r"^[\s~]+$", TagSplitted[tagIdx]): #check if current subtag does only contain "~" and spacechars
+            if re.match(r"([\w]+)", TagSplitted[tagIdx-1]) and re.match(r"([\w]+)", TagSplitted[tagIdx+1]):
+                TagSplitted[tagIdx] = " & " + TagSplitted[tagIdx]
         
     
     ExpressionString = ''.join(TagSplitted)
@@ -447,39 +479,41 @@ if __name__  == "__main__":
     print("Please use ./gui.py instead...")
 
 
-firstTimeInit()
-try:
-    _newFile("testFile.txt")
-except Exception:
-    pass
-try:
-    _newFile("testFile2.txt")
-except Exception:
-    pass
-try:
-    _newFile("testFile3.txt")
-except Exception:
-    pass
-newTag("tagA","datengrab_root")
-newTag("tagB","datengrab_root")
-newTag("tagC","datengrab_root")
-newTag("tagC_childA","tagC")
-addTagToFile("testFile.txt","tagA")
-addTagToFile("testFile.txt","tagB")
-addTagToFile("testFile2.txt","tagA")
-addTagToFile("testFile2.txt","tagC")
-addTagToFile("testFile2.txt","tagC_childA")
-addTagToFile("testFile3.txt","tagB")
-addTagToFile("testFile3.txt","tagC")
-findTagsOfFile("testFile.txt")
-findTagsOfFile("testFile2.txt")
-
-sqlCursor.execute("SELECT * FROM tags")
-print(sqlCursor.fetchall())
+if(firstTimeInit()):
+    #initialize database
+    try:
+        _newFile("testFile.txt")
+    except Exception:
+        pass
+    try:
+        _newFile("testFile2.txt")
+    except Exception:
+        pass
+    try:
+        _newFile("testFile3.txt")
+    except Exception:
+        pass
+    newTag("tagA","datengrab_root")
+    newTag("tagB","datengrab_root")
+    newTag("tagC","datengrab_root")
+    newTag("tagC_childA","tagC")
+    addTagToFile("testFile.txt","tagA")
+    addTagToFile("testFile.txt","tagB")
+    addTagToFile("testFile2.txt","tagA")
+    addTagToFile("testFile2.txt","tagC")
+    addTagToFile("testFile2.txt","tagC_childA")
+    addTagToFile("testFile3.txt","tagB")
+    addTagToFile("testFile3.txt","tagC")
+    
+    #create demo files
+    Path(Path.cwd() / filestorage_location).mkdir(parents=True, exist_ok=True)
+    Path(Path.cwd() / filestorage_location / "testFile.txt").touch()
+    Path(Path.cwd() / filestorage_location / "testFile2.txt").touch()
+    Path(Path.cwd() / filestorage_location / "testFile3.txt").touch()
+    
 
 #findFileWithTags("tagC")
 #findFileWithTags("tagA  tagB")
-#print(findFilesWithTags("tagA | tagC_childA"))
+#print(getFilesWithTags("tagA | tagC_childA"))
 getTagHierarchy()
 
-sqlDB.commit()

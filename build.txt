@@ -1,0 +1,5 @@
+#for initial setup
+pip3 install pyinstaller
+
+#for generating the executable, writing to ./dist/gui/gui.exe
+python3 -m PyInstaller -F .\gui.py

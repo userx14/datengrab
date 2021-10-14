@@ -1,7 +1,1 @@
-the search query (! tagname) breaks because the space character is replaced with an and character
-->TODO only insert & when the adjacent items are tags
-
-file search function is not working yet
-deleting tags in the backeng (recursive for child tags)
-adding tags underneath a selected tag
-missing dialog in selected tags to "apply to all" and "remove from all"
+Selected files view does not refresh on some changes of the tag names.
